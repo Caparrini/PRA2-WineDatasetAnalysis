@@ -16,6 +16,12 @@ library(nortest)
 library(ggplot2)
 library(corrplot)
 library(nnet)
+library(car)
+library(caret)
+if(!require(C50)){
+    install.packages('C50', repos='http://cran.us.r-project.org')
+    library(C50)
+}
 ```
 
 # Detalles de la actividad
@@ -94,21 +100,62 @@ str(winedataset)
 
 Vemos que las 11 variables que utilizamos para predecir son variables numéricas continuas y la variable *quality* que es el objetivo es una variable numérica entera.
 
-Pasamos a comprobar valores nulos o vacíos.
+
+### Valores nulos o vacíos.
 
 ```{r nulos}
 sapply(winedataset, function(x) sum(is.na(x)))
 ```
 
-Ninguna de las variables tiene registros nulos o vacíos.
+Ninguna de las variables parece tener registros nulos o vacíos, sin embargo en ocasiones el valor cero puede indicar valores perdidos o nulos. Observando el sumario mostrado anteriormente de las variables vemos que solo la variable citric.acid llega a tener el valor cero. Vamos a comprobar con un boxplot que no hay muchos valores outliers hacia el cero.
+
+```{r}
+ggplot(winedataset, aes(x="citric.acid", y=citric.acid))+geom_boxplot()
+```
+
+Las demás variables queda descartado que tengan valores nulos por ceros, y en el caso de citric.acid no parecen que el valor cero sea incorrecto. Lo que si podemos percibir en este boxplot es un punto que parece un valor extremo ("outlier").
+
+### Valores extremos
+
+Los valores extremos ("outliers") son valores que debido a ser considerablemente distintos al resto de los datos podría considerarse que no perteneces a la población. Para identificarlos podríamos dibujar los boxplots para todas las variables (como se ha visto en el apartado anterior para la variable citric.acid) pero también podemos utilizar la función boxplot.stats() que nos muestra directamente los valores extremos:
+
+```{r}
+for (c in colnames(winedataset)){
+  print(c)
+  print(boxplot.stats(winedataset[,c])$out)
+}
+```
+
+Podemos observar (entre otros) que el citric.acid con valor 1 es un outlier. Para no eliminar estos datos del dataset vamos a asignarles el valor de percentil 5% a los que sean valores extremos inferiores y el valor del percentil 95% a los valores extremos superiores.
+
+```{r}
+cut_outliers <- function(x){
+  quantiles <- quantile( x, c(.05, .95))
+  x[ x < quantiles[1]] <- quantiles[1]
+  x[ x > quantiles[2]] <- quantiles[2]
+  return(x)
+}
+
+winedataset <- as.data.frame( sapply(winedataset, cut_outliers) )
+```
+
+La variable objetivo tenía muchos valores extremos que hemos filtrado también, quedando de la siguiente manera.
+
+```{r}
+ggplot(winedataset, aes(x=quality)) + geom_histogram()
+```
+
+Por ello vamos a tratar esta variable como una variable categórica con 3 clases.
+
 
 ## Análisis de los datos
 
+### Comprobación de normalidad
 
 Comprobamos si alguna de las variables cumple las características de una distribución normal. Para ello aplicamos el test de [Shaphiro-Wilk](https://en.wikipedia.org/wiki/Shapiro–Wilk_test). Aplicando este test la hipótesis nula es que la distribución cumple normalidad, por ello, para no rechazar la hipótesis nula el p-valor tiene que ser mayor que el nivel de significación elegido (alpha=0.05).
 ```{r normaldist}
 alpha <- 0.05
-for(n in names(winedataset)){
+for(n in names(winedataset)[-12]){
   pvalue <- shapiro.test(winedataset[,n])$p.value
   if(pvalue>alpha){
     cat("Variable ", n, " SI es normal\n")
@@ -123,7 +170,7 @@ Vemos que según este test ninguna variable cumple una distribución normal, pro
 
 ```{r normaldistad}
 alpha <- 0.05
-for(n in names(winedataset)){
+for(n in names(winedataset)[-12]){
   pvalue <- ad.test(winedataset[,n])$p.value
   if(pvalue>alpha){
     cat("Variable ", n, " SI es normal\n")
@@ -134,14 +181,34 @@ for(n in names(winedataset)){
 }
 ```
 
+### Comprobación de homogeneidad en la varianza
+
+Dado que las variables que tenemos no siguen una distribución normal vamos a utilizar el test de Levene que es ampliamente utilizado en la literatura para comprobar la homogeneidad de las varianzas de las variables.
+
+```{r}
+alpha <- 0.05
+for(n in names(winedataset)[-12]){
+  pvalue <- leveneTest(winedataset[,n] ~ as.factor(winedataset$quality))$Pr[1]
+  if(is.nan(pvalue)){
+    pvalue <- 0
+  }
+  if(pvalue>alpha){
+    cat("Variable ", n, " SI tiene una varianza homogénea\n")
+    print(leveneTest(winedataset[,n] ~ as.factor(winedataset$quality))$Pr[1])
+  }else{
+    cat("Variable ", n, " NO tiene una varianza homogénea\n")
+  }
+}
+```
+
+Tenemos 3 variables que tienen una varianza homogénea chlorides, pH y sulphates.
 
 ## Pruebas estadísticas
 
 Es interesante comprobar la capacidad explicativa de la *quality* para cada variable. Para ello vamos a calcular los coeficientes de correlación de Spearman. Es necesario utilizar los de Spearman ya que nos encontramos con variables que no siguen una distribución normal.
 
 ```{r corr}
-
-corrplot(cor(winedataset, method = c("spearman")))
+corrplot(cor(winedataset, method = c("spearman")), method = "number", tl.pos = 'l', tl.cex= 0.5)
 ```
 
 Nos encontramos con dos variables que estan positivamente correlacionadas con la calidad que son *alcohol* y *sulphates*. Estas dos variables tienen la mayor correlación positiva por lo que a mayor nivel de estas dos mayor calidad en el vino.
@@ -152,15 +219,21 @@ Correlación positiva algo inferior tenemos *fixed.acidity* y *citric.acid*.
 
 Y con una correlación negativa pero también pequeña *chlorides*, *total.sulfur.dioxide* y *density*.
 
+### Regressión lineal
 
 Vamos a crear un modelo de regresión lineal que estime la calidad del vino. Para ello vamos a crear 11 modelos distintos y quedarnos con el mejor. Como criterio de construcción vamos a ir añadiendo las variables con el coeficiente de correlación mayor en valor absoluto.
 
+
 ```{r lm}
+winedataset$quality <- sapply(winedataset$quality, as.numeric)
+
 
 cor_data <- cor(winedataset, method = c("spearman"))
 
 quality_cor <- sort(abs(cor_data[, "quality"]))
 vars_names <- names(quality_cor)
+
+
 
 model11 <- lm(quality ~ residual.sugar + pH + free.sulfur.dioxide 
               + fixed.acidity + density + 
@@ -284,10 +357,52 @@ cbind(my_index, pred_model, pred_mmodel, label=winedataset$quality[my_index])
 
 A pesar de que las etiquetas reales son enteras el modelo de regresión nos da una información más detallada ya que existen valores continuos entre una clase y otra (que podría relacionarse con la probabilidad de pertenecer a una clase que el modelo de clasificación acaba redondeando).
 
+
+### Árbol de decisión
+
+Vamos a probar un árbol de decisión, en primer lugar para ello partimos el conjunto en conjunto para entrenar y el conjunto donde comprobaremos la capacidad predictiva del modelo.
+
+```{r}
+winedataset$quality <- sapply(winedataset$quality, as.factor)
+
+train_index <- sample(1:nrow(winedataset), 0.8 * nrow(winedataset))
+test_index <- setdiff(1:nrow(winedataset), train_index)
+
+X_train <- winedataset[train_index, -12]
+y_train <- winedataset[train_index, 12]
+
+X_test <- winedataset[test_index, -12]
+y_test <- winedataset[test_index, 12]
+```
+```{r}
+model <- C50::C5.0(X_train, y_train)
+summary(model)
+```
+
+Comprobamos el poder predictivo.
+
+```{r}
+predictions_train <- predict(model, X_train, type="class")
+accuracy_train <- 100*sum(predictions_train == y_train) / length(predictions_train)
+predictions_test <- predict(model, X_test, type="class")
+accuracy_test <- 100*sum(predictions_test == y_test) / length(predictions_test)
+print(sprintf("La precisión del árbol en entrenamiento es: %.4f %%", accuracy_train))
+print(sprintf("La precisión del árbol en prueba es: %.4f %%", accuracy_test))
+```
+Vemos que sobre el conjunto de entrenamiento la accuracy ha sido mejor pero se degrada sobre el conjunto de prueba.
+
+```{r}
+cm <- table(y_test,Predicted=predictions_test)
+#El paquete caret nos ofrece estadísticas sobre la matrix de confusión
+confusionMatrix(cm)
+```
+
 # Conclusiones
 
-En primer lugar se ha verificado que las variables del dataset no contenían valores nulos y que todas eran candidatas a aportar información en el análisis. No ha sido necesaria ninguna transformación en el conjunto de datos, aunque se podría categorizar alguna de las variables o disminuir la cantidad de outliers.
+En primer lugar se ha verificado que las variables del dataset no contenían valores nulos y que todas eran candidatas a aportar información en el análisis. Hemos cambiado los valores outliers por los percentiles 5% y 95% respectivamente para lo valores extremos inferiores y superiores, entre los que también se encontraba la variable objetivo.
 
 Se ha confirmado mediante test estadísticos la no normalidad de las variables y se ha empleado los coeficientes de correlación de Spearman para ver las variables más influyentes en la calidad. De esta manera hemos visto que el grado de alcohol y los sulfitos tienes un efecto positivo en la calidad, mientras que la cantidad de ácido acético influye en la disminución de la calidad.
 
-Por otro lado se han creado dos modelos de regressión para estimar la calidad. Estos modelos no tienen una gran capacidad predictiva pero como se menciono en la introducción pueden ser utilizados para disminuir la cantidad de vinos que ha de catar un experto a los inicialmente estimados por el modelo.
+Por otro lado se han creado dos modelos de regresión para estimar la calidad. Estos modelos no tienen una gran capacidad predictiva pero como se menciono en la introducción pueden ser utilizados para disminuir la cantidad de vinos que ha de catar un experto a los inicialmente estimados por el modelo.
+
+Finalmente hemos creado un árbol de decisión con una precisión balanceada del 70% entre las 3 clases que es razonable ya que un clasificador que tuviera un criterio aleatorio al elegir entre tres clases tendría una precisión del 33%.
